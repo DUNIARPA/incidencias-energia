@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SolarTech PRO</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={darkMode:'class'}</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  body{font-family:'Segoe UI',sans-serif;}
+  .fade-in{animation:fadeIn .35s ease;}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+  .pulse-red{animation:pulseRed 1.6s infinite;}
+  @keyframes pulseRed{0%,100%{background-color:#fef2f2;}50%{background-color:#fecaca;}}
+  .dark .pulse-red{animation:pulseRedDark 1.6s infinite;}
+  @keyframes pulseRedDark{0%,100%{background-color:#450a0a;}50%{background-color:#7f1d1d;}}
+  .grow-tree{animation:growTree .6s ease forwards;}
+  @keyframes growTree{from{transform:scale(0) rotate(-10deg);opacity:0;}to{transform:scale(1) rotate(0);opacity:1;}}
+  .tab-active{background:#1e40af;color:#fff;}
+  ::-webkit-scrollbar{width:6px;height:6px;}
+  ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:10px;}
+</style>
+</head>
+<body class="bg-gray-50 dark:bg-gray-950 dark:text-gray-100 min-h-screen transition-colors">
+<div id="app"></div>
+
+<script>
+// ============================================================
+const SB_URL = "https://tvfajfbmvntucbjuacuv.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR2ZmFqZmJtdm50dWNianVhY3V2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEyNjEwMTIsImV4cCI6MjA5NjgzNzAxMn0.7eKyLExOplsO8fCvGWRXTFmS6xLWqzD4zL9DRTbmqDc";
+const TABLE = "anomaliasenergia";
+const PRECIO_KWH = 0.15;
+const CO2_POR_KWH = 0.25;
+const KG_CO2_POR_ARBOL = 22;
+const CONSUMO_HOGAR_ANUAL = 3500;
+const SLA_HORAS_CONFIRMACION = 2;
+const SLA_HORAS_RESOLUCION_DEFECTO = 24;
+
+let currentUser = null;
+let incidents = [];
+let tecnicosDB = [];
+let responsablesDB = [];
+let currentIncident = null;
+let currentTab = "dashboard";
+let pollHandle = null;
+let darkMode = false;
+
+async function sb(path, opts={}) {
+  const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
+    ...opts,
+    headers:{
+      "Content-Type":"application/json", apikey:SB_KEY, Authorization:`Bearer ${SB_KEY}`,
+      Prefer:"return=representation", ...(opts.headers||{})
+    }
+  });
+  const t = await r.text();
+  return t ? JSON.parse(t) : [];
+}
+
+async function loadAll() {
+  try {
+    [incidents, tecnicosDB, responsablesDB] = await Promise.all([
+      sb(`${TABLE}?order=id_anomalia.desc`),
+      sb(`tecnicos?order=nombre.asc`),
+      sb(`responsables?order=nombre.asc`)
+    ]);
+    render();
+  } catch(e) { toast("Error cargando datos: "+e.message,"error"); }
+}
+
+async function patchInc(id, payload) {
+  return sb(`${TABLE}?id_anomalia=eq.${id}`, {method:"PATCH", body:JSON.stringify(payload)});
+}
+
+function applyDarkMode(){ document.documentElement.classList.toggle("dark", darkMode); }
+function toggleDarkMode(){ darkMode = !darkMode; applyDarkMode(); render(); }
+
+function fmt(v){ return v ? new Date(v).toLocaleString("es-ES") : "—"; }
+function fmtMoney(v){ return v.toLocaleString("es-ES",{minimumFractionDigits:2,maximumFractionDigits:2})+" €"; }
+function horasDesde(v){ return v ? (Date.now()-new Date(v).getTime())/3600000 : null; }
+function horasEntre(a,b){ return (new Date(b)-new Date(a))/3600000; }
+function gravedadDe(desv){
+  const d = Math.abs(parseFloat(desv)||0);
+  if (d>40) return "Grave";
+  if (d>=20) return "Leve";
+  return null;
+}
+function gravBadge(g){
+  if(!g) return '<span class="text-xs text-gray-400 dark:text-gray-500">—</span>';
+  const c = g==="Grave" ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300" : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300";
+  return `<span class="px-2 py-0.5 rounded-full text-xs font-bold ${c}">${g}</span>`;
+}
+function estadoBadge(e){
+  const map = {
+    "Pendiente":"bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300",
+    "Confirmada":"bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
+    "En gestión":"bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300",
+    "Escalada":"bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+    "Resuelta":"bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300"
+  };
+  return `<span class="px-2 py-0.5 rounded-full text-xs font-semibold ${map[e]||"bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"}">${e||"Sin estado"}</span>`;
+}
+function toast(msg,type="success"){
+  const d=document.createElement("div");
+  d.className=`fixed bottom-4 right-4 z-[60] px-4 py-3 rounded-xl shadow-lg text-sm font-medium fade-in ${type==="error"?"bg-red-600 text-white":"bg-green-600 text-white"}`;
+  d.textContent=msg; document.body.appendChild(d); setTimeout(()=>d.remove(),3500);
+}
+function impactoDe(i){
+  const real = parseFloat(i.lectura_real_kwh)||0;
+  const est = parseFloat(i.lectura_estimada_kwh)||0;
+  const perdida = Math.max(est-real,0);
+  return { perdida, dinero: perdida*PRECIO_KWH, co2: real*CO2_POR_KWH };
+}
+function appendHistorial(i, accion){
+  const ts = new Date().toLocaleString("es-ES");
+  const autor = `${currentUser.nombre} (${currentUser.rol==="responsable"?"Responsable":"Técnico"})`;
+  const linea = `[${ts}] ${autor} → ${accion}`;
+  const prev = i.historial_arreglos || "";
+  return prev ? `${prev}\n${linea}` : linea;
+}
+function parseTiempoEstimadoHoras(txt){
+  if (!txt) return SLA_HORAS_RESOLUCION_DEFECTO;
+  const m = String(txt).match(/(\d+)/);
+  return m ? parseInt(m[1],10) : SLA_HORAS_RESOLUCION_DEFECTO;
+}
+
+function renderLogin(){
+  document.getElementById("app").innerHTML = `
+  <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-950 via-blue-800 to-amber-600 p-4">
+    <div class="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl w-full max-w-sm p-8 fade-in">
+      <div class="text-center mb-7">
+        <div class="w-16 h-16 bg-gradient-to-br from-yellow-300 to-amber-500 rounded-2xl flex items-center justify-center mx-auto mb-3 text-3xl shadow-lg">☀️</div>
+        <h1 class="text-2xl font-extrabold text-gray-900 dark:text-white">SolarTech <span class="text-blue-600 dark:text-blue-400">PRO</span></h1>
+        <p class="text-xs text-gray-400 mt-1">Sistema Integral de Incidencias Fotovoltaicas</p>
+      </div>
+      <div class="space-y-3">
+        <input id="loginEmail" type="email" placeholder="correo@solartech.com" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+        <input id="loginPass" type="password" placeholder="••••••••" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+        <div id="loginError" class="text-red-600 text-sm hidden"></div>
+        <button onclick="doLogin()" class="w-full bg-blue-700 hover:bg-blue-800 text-white font-bold py-3 rounded-xl transition-colors">Iniciar sesión</button>
+      </div>
+      <div class="mt-5 p-3 bg-gray-50 dark:bg-gray-800 rounded-xl text-xs text-gray-500 dark:text-gray-400">
+        <p class="font-semibold text-gray-600 dark:text-gray-300 mb-1">Accesos de prueba:</p>
+        <p>👔 laura@solartech.com / responsable123</p>
+        <p>🔧 carlos@solartech.com / tecnico123</p>
+      </div>
+      <button onclick="toggleDarkMode()" class="mt-4 w-full text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">${darkMode?"☀️ Modo claro":"🌙 Modo oscuro"}</button>
+    </div>
+  </div>`;
+  ["loginEmail","loginPass"].forEach(id=>document.getElementById(id).addEventListener("keydown",e=>e.key==="Enter"&&doLogin()));
+}
+
+async function doLogin(){
+  const email = document.getElementById("loginEmail").value.trim().toLowerCase();
+  const pass = document.getElementById("loginPass").value;
+  try{
+    const [tecs, resps] = await Promise.all([
+      sb(`tecnicos?email=eq.${encodeURIComponent(email)}&activo=eq.true`),
+      sb(`responsables?email=eq.${encodeURIComponent(email)}&activo=eq.true`)
+    ]);
+    let user = null;
+    if (resps[0] && resps[0].password === pass) user = {...resps[0], rol:"responsable"};
+    else if (tecs[0] && tecs[0].password === pass) user = {...tecs[0], rol:"tecnico"};
+    if (!user){
+      const el=document.getElementById("loginError");
+      el.textContent="Usuario o contraseña incorrectos"; el.classList.remove("hidden");
+      return;
+    }
+    currentUser = user;
+    await loadAll();
+    pollHandle = setInterval(loadAll, 30000);
+  }catch(e){ toast("Error de conexión: "+e.message,"error"); }
+}
+
+function doLogout(){
+  currentUser=null; clearInterval(pollHandle); currentTab="dashboard";
+  renderLogin();
+}
+
+function render(){
+  applyDarkMode();
+  const isResp = currentUser.rol==="responsable";
+  const tabs = [
+    ["dashboard","📊 Dashboard"],
+    ["sla","🎯 SLA / KPIs"],
+    ["incidencias","⚡ Incidencias"],
+    ["mapa","🗺️ Mapa"],
+    ["bosque","🌳 Bosque Solar"],
+    ["impacto","💰 Impacto"],
+    ["ranking","🏆 Ranking"],
+    ["historial","📥 Historial"],
+  ];
+  if (isResp) tabs.push(["usuarios","👥 Usuarios"]);
+
+  document.getElementById("app").innerHTML = `
+  <div class="min-h-screen bg-gray-50 dark:bg-gray-950 transition-colors">
+    <header class="bg-white dark:bg-gray-900 border-b dark:border-gray-800 shadow-sm sticky top-0 z-20">
+      <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 bg-gradient-to-br from-yellow-300 to-amber-500 rounded-xl flex items-center justify-center text-xl">☀️</div>
+          <div>
+            <h1 class="font-bold text-gray-900 dark:text-white text-sm sm:text-base leading-tight">SolarTech PRO</h1>
+            <p class="text-xs text-gray-400">${currentUser.nombre} · ${isResp?"👔 Responsable":"🔧 Técnico"}</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="toggleDarkMode()" class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg text-sm">${darkMode?"☀️":"🌙"}</button>
+          <button onclick="loadAll()" class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg text-sm">↻</button>
+          <button onclick="doLogout()" class="px-3 py-1.5 bg-red-50 dark:bg-red-900/30 hover:bg-red-100 dark:hover:bg-red-900/50 rounded-lg text-sm text-red-600 dark:text-red-300 font-medium">Salir</button>
+        </div>
+      </div>
+      <nav class="max-w-7xl mx-auto px-4 flex gap-1 overflow-x-auto pb-2">
+        ${tabs.map(([k,l])=>`<button onclick="switchTab('${k}')" class="px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold whitespace-nowrap transition-colors ${currentTab===k?'tab-active':'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'}">${l}</button>`).join("")}
+      </nav>
+    </header>
+    <main class="max-w-7xl mx-auto px-4 py-5" id="mainContent"></main>
+  </div>`;
+  renderTab();
+}
+
+function switchTab(t){ currentTab=t; renderTab(); }
+
+function renderTab(){
+  const el = document.getElementById("mainContent");
+  el.innerHTML = `<div class="fade-in">${
+    currentTab==="dashboard" ? viewDashboard() :
+    currentTab==="sla" ? viewSLA() :
+    currentTab==="incidencias" ? viewIncidencias() :
+    currentTab==="mapa" ? viewMapa() :
+    currentTab==="bosque" ? viewBosque() :
+    currentTab==="impacto" ? viewImpacto() :
+    currentTab==="ranking" ? viewRanking() :
+    currentTab==="historial" ? viewHistorialDescarga() :
+    currentTab==="usuarios" ? viewUsuarios() : ""
+  }</div>`;
+  if (currentTab==="impacto") setTimeout(drawImpactoCharts, 50);
+  if (currentTab==="bosque") setTimeout(drawBosqueChart, 50);
+  if (currentTab==="sla") setTimeout(drawSLACharts, 50);
+}
+
+function calcularMetricasSLA(){
+  const conRespuesta = incidents.filter(i=>i.fecha_hora_ejecucion && i.fecha_confirmacion);
+  const tiemposRespuesta = conRespuesta.map(i=>horasEntre(i.fecha_hora_ejecucion, i.fecha_confirmacion));
+  const tiempoMedioRespuesta = tiemposRespuesta.length ? tiemposRespuesta.reduce((a,b)=>a+b,0)/tiemposRespuesta.length : null;
+
+  const conResolucion = incidents.filter(i=>i.fecha_confirmacion && i.fecha_resolucion);
+  const tiemposResolucion = conResolucion.map(i=>horasEntre(i.fecha_confirmacion, i.fecha_resolucion));
+  const tiempoMedioResolucion = tiemposResolucion.length ? tiemposResolucion.reduce((a,b)=>a+b,0)/tiemposResolucion.length : null;
+
+  const resueltasConPlazo = incidents.filter(i=>i.fecha_confirmacion && i.fecha_resolucion);
+  let dentroPlazo = 0;
+  resueltasConPlazo.forEach(i=>{
+    const horasComprometidas = parseTiempoEstimadoHoras(i.tiempo_estimado_reparacion);
+    const horasReales = horasEntre(i.fecha_confirmacion, i.fecha_resolucion);
+    if (horasReales <= horasComprometidas) dentroPlazo++;
+  });
+  const pctDentroPlazo = resueltasConPlazo.length ? (dentroPlazo/resueltasConPlazo.length*100) : null;
+
+  const escaladas = incidents.filter(i=>i.escalado_responsable);
+  const pctEscaladas = incidents.length ? (escaladas.length/incidents.length*100) : 0;
+
+  const fueraSLA = incidents.filter(i=>{
+    if (i.estado_actual==="Resuelta") return false;
+    if (!i.fecha_confirmacion && horasDesde(i.fecha_hora_ejecucion) > SLA_HORAS_CONFIRMACION) return true;
+    if (i.fecha_confirmacion){
+      const limite = parseTiempoEstimadoHoras(i.tiempo_estimado_reparacion);
+      if (horasDesde(i.fecha_confirmacion) > limite) return true;
+    }
+    return false;
+  });
+
+  const conEscalado = incidents.filter(i=>i.escalado_responsable && i.fecha_escalado && i.fecha_hora_ejecucion);
+  const tiemposEscalado = conEscalado.map(i=>horasEntre(i.fecha_hora_ejecucion, i.fecha_escalado));
+  const tiempoMedioEscalado = tiemposEscalado.length ? tiemposEscalado.reduce((a,b)=>a+b,0)/tiemposEscalado.length : null;
+
+  return { tiempoMedioRespuesta, tiempoMedioResolucion, pctDentroPlazo, pctEscaladas, fueraSLA, tiempoMedioEscalado, totalEscaladas:escaladas.length };
+}
+
+function viewSLA(){
+  const m = calcularMetricasSLA();
+  const fmtH = v => v==null ? "—" : v.toFixed(1)+"h";
+  const fmtPct = v => v==null ? "—" : v.toFixed(0)+"%";
+
+  const cards = [
+    {l:"Tiempo medio 1ª respuesta", v:fmtH(m.tiempoMedioRespuesta), sub:"Detección → Confirmación técnico", c:"text-blue-600 dark:text-blue-400", ic:"⏱️"},
+    {l:"Tiempo medio resolución", v:fmtH(m.tiempoMedioResolucion), sub:"Confirmación → Resolución", c:"text-green-600 dark:text-green-400", ic:"✅"},
+    {l:"% resueltas en plazo", v:fmtPct(m.pctDentroPlazo), sub:"Dentro del tiempo comprometido", c:m.pctDentroPlazo!=null&&m.pctDentroPlazo<70?"text-red-600 dark:text-red-400":"text-emerald-600 dark:text-emerald-400", ic:"🎯"},
+    {l:"% incidencias escaladas", v:fmtPct(m.pctEscaladas), sub:`${m.totalEscaladas} de ${incidents.length} incidencias`, c:m.pctEscaladas>20?"text-red-600 dark:text-red-400":"text-orange-500", ic:"⚠️"},
+    {l:"Incidencias fuera de SLA", v:m.fueraSLA.length, sub:"Activas ahora, plazo superado", c:"text-red-600 dark:text-red-400", ic:"🚨"},
+    {l:"Tiempo medio de escalado", v:fmtH(m.tiempoMedioEscalado), sub:"Detección → Escalado a Responsable", c:"text-purple-600 dark:text-purple-400", ic:"📈"},
+  ];
+
+  return `
+  <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-5">
+    ${cards.map(c=>`
+      <div class="bg-white dark:bg-gray-900 border dark:border-gray-800 rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-2xl">${c.ic}</span>
+        </div>
+        <div class="text-3xl font-bold ${c.c}">${c.v}</div>
+        <div class="text-sm font-semibold text-gray-700 dark:text-gray-200 mt-1">${c.l}</div>
+        <div class="text-xs text-gray-400 mt-0.5">${c.sub}</div>
+      </div>`).join("")}
+  </div>
+
+  ${m.fueraSLA.length ? `
+  <div class="bg-red-50 dark:bg-red-950/40 border-2 border-red-300 dark:border-red-800 rounded-2xl p-4 mb-5">
+    <p class="font-bold text-red-700 dark:text-red-300 mb-2">🚨 Incidencias actualmente fuera de SLA</p>
+    <div class="space-y-1">
+      ${m.fueraSLA.map(i=>`<div class="text-sm text-red-700 dark:text-red-300 cursor-pointer hover:underline" onclick="openIncident(${i.id_anomalia})">• #${i.id_anomalia} — ${i.ubicacion||"—"} (${i.estado_actual||"Pendiente"})</div>`).join("")}
+    </div>
+  </div>` : ""}
+
+  <div class="bg-white dark:bg-gray-900 border dark:border-gray-800 rounded-2xl p-4">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-3 text-sm">Distribución de tiempos de respuesta y resolución</h3>
+    <canvas id="slaChart" height="100"></canvas>
+  </div>`;
+}
+
+function drawSLACharts(){
+  const ctx = document.getElementById("slaChart"); if(!ctx) return;
+  const labels = incidents.filter(i=>i.fecha_confirmacion).map(i=>`#${i.id_anomalia}`);
+  const respuesta = incidents.filter(i=>i.fecha_confirmacion).map(i=>i.fecha_hora_ejecucion?horasEntre(i.fecha_hora_ejecucion,i.fecha_confirmacion):0);
+  const resolucion = incidents.filter(i=>i.fecha_confirmacion).map(i=>i.fecha_resolucion?horasEntre(i.fecha_confirmacion,i.fecha_resolucion):0);
+  new Chart(ctx, {type:"bar", data:{labels, datasets:[
+    {label:"Hrs. 1ª respuesta", data:respuesta, backgroundColor:"#3b82f6", borderRadius:4},
+    {label:"Hrs. resolución", data:resolucion, backgroundColor:"#10b981", borderRadius:4}
+  ]}, options:{plugins:{legend:{position:"top"}}, scales:{y:{beginAtZero:true}}}});
+}
+
+function viewDashboard(){
+  const stats = {
+    total: incidents.length,
+    pendientes: incidents.filter(i=>!i.estado_actual||i.estado_actual==="Pendiente").length,
+    gestion: incidents.filter(i=>i.estado_actual==="En gestión").length,
+    resueltas: incidents.filter(i=>i.estado_actual==="Resuelta").length,
+    escaladas: incidents.filter(i=>i.escalado_responsable).length,
+  };
+  const m = calcularMetricasSLA();
+  const tecnicosActivos = [...new Set(incidents.filter(i=>i.tecnico_asignado).map(i=>i.tecnico_asignado))].length;
+
+  const alertas2h = incidents.filter(i=>!i.fecha_confirmacion && i.estado_actual!=="Resuelta" && !i.escalado_responsable && horasDesde(i.fecha_hora_ejecucion)>2);
+  const alertas10h = incidents.filter(i=>i.fecha_confirmacion && !i.fecha_resolucion && !i.escalado_responsable && horasDesde(i.fecha_confirmacion)>10);
+  const escaladasActivas = incidents.filter(i=>i.escalado_responsable && i.estado_actual!=="Resuelta");
+
+  const cards = [
+    {l:"Total incidencias",v:stats.total,c:"text-gray-900 dark:text-white",bg:"bg-white dark:bg-gray-900",ic:"📋"},
+    {l:"Pendientes",v:stats.pendientes,c:"text-yellow-700 dark:text-yellow-400",bg:"bg-yellow-50 dark:bg-yellow-900/20",ic:"⏳"},
+    {l:"En gestión",v:stats.gestion,c:"text-purple-700 dark:text-purple-400",bg:"bg-purple-50 dark:bg-purple-900/20",ic:"🔧"},
+    {l:"Resueltas",v:stats.resueltas,c:"text-green-700 dark:text-green-400",bg:"bg-green-50 dark:bg-green-900/20",ic:"✅"},
+    {l:"Escaladas",v:stats.escaladas,c:"text-red-700 dark:text-red-400",bg:"bg-red-50 dark:bg-red-900/20",ic:"⚠️"},
+    {l:"Tiempo medio resolución",v:m.tiempoMedioResolucion!=null?m.tiempoMedioResolucion.toFixed(1)+"h":"—",c:"text-blue-700 dark:text-blue-400",bg:"bg-blue-50 dark:bg-blue-900/20",ic:"⏱️"},
+    {l:"Técnicos activos",v:tecnicosActivos,c:"text-indigo-700 dark:text-indigo-400",bg:"bg-indigo-50 dark:bg-indigo-900/20",ic:"👷"},
+  ];
+
+  let escaladoHtml = "";
+  if (currentUser.rol==="responsable" && (alertas2h.length||alertas10h.length||escaladasActivas.length)){
+    escaladoHtml = `<div class="bg-red-50 dark:bg-red-950/40 border-2 border-red-300 dark:border-red-800 rounded-2xl p-4 mb-5 pulse-red">
+      <p class="font-bold text-red-700 dark:text-red-300 mb-2 flex items-center gap-2">🚨 Panel de escalados — Acción requerida</p>
+      ${escaladasActivas.map(i=>`<div class="text-sm text-red-700 dark:text-red-300 cursor-pointer hover:underline" onclick="openIncident(${i.id_anomalia})">• ESCALADA #${i.id_anomalia} — ${i.motivo_escalado||"Ver detalle"}</div>`).join("")}
+      ${alertas2h.map(i=>`<div class="text-sm text-orange-700 dark:text-orange-300 cursor-pointer hover:underline" onclick="openIncident(${i.id_anomalia})">• #${i.id_anomalia} — Sin confirmar tras 2h (técnico de guardia no respondió)</div>`).join("")}
+      ${alertas10h.map(i=>`<div class="text-sm text-orange-700 dark:text-orange-300 cursor-pointer hover:underline" onclick="openIncident(${i.id_anomalia})">• #${i.id_anomalia} — Sin resolver tras 10h desde confirmación</div>`).join("")}
+    </div>`;
+  }
+
+  const cargaTecnicos = tecnicosDB.map(t=>{
+    const abiertas = incidents.filter(i=>i.tecnico_asignado===t.nombre && i.estado_actual!=="Resuelta").length;
+    return {nombre:t.nombre, abiertas};
+  });
+
+  return `
+  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-5">
+    ${cards.map(c=>`<div class="${c.bg} rounded-xl p-3 border dark:border-gray-800"><div class="text-xl mb-1">${c.ic}</div><div class="text-xl font-bold ${c.c}">${c.v}</div><div class="text-xs text-gray-500 dark:text-gray-400">${c.l}</div></div>`).join("")}
+  </div>
+  ${escaladoHtml}
+  ${currentUser.rol==="responsable" ? `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4 mb-5">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-3 text-sm">Carga de trabajo por técnico</h3>
+    <div class="space-y-2">
+      ${cargaTecnicos.map(t=>`<div class="flex items-center gap-3">
+        <span class="text-sm text-gray-600 dark:text-gray-300 w-32 truncate">${t.nombre}</span>
+        <div class="flex-1 bg-gray-100 dark:bg-gray-800 rounded-full h-3 overflow-hidden"><div class="bg-blue-500 h-3 rounded-full" style="width:${Math.min(t.abiertas*20,100)}%"></div></div>
+        <span class="text-xs font-bold text-gray-700 dark:text-gray-300 w-8">${t.abiertas}</span>
+      </div>`).join("")}
+    </div>
+  </div>` : ""}
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-3 text-sm">Últimas incidencias</h3>
+    ${tablaIncidencias(incidents.slice(0,6))}
+  </div>`;
+}
+
+function tablaIncidencias(list){
+  if (!list.length) return `<p class="text-sm text-gray-400 text-center py-8">No hay incidencias</p>`;
+  return `<div class="overflow-x-auto"><table class="w-full text-sm">
+    <thead><tr class="bg-gray-50 dark:bg-gray-800 border-b dark:border-gray-700">
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">ID</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase hidden sm:table-cell">Inversor</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">Ubicación</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">Gravedad</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">Desv.%</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">Estado</th>
+      <th class="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase hidden md:table-cell">Técnico</th>
+      <th></th>
+    </tr></thead><tbody>
+    ${list.map((i,idx)=>{
+      const g = i.gravedad || gravedadDe(i.desviacion_porcentaje);
+      const desv = i.desviacion_porcentaje!=null ? parseFloat(i.desviacion_porcentaje).toFixed(1)+"%" : "—";
+      return `<tr class="border-b dark:border-gray-800 last:border-0 cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${i.escalado_responsable&&i.estado_actual!=="Resuelta"?"pulse-red":idx%2?"bg-gray-50/50 dark:bg-gray-800/30":""}" onclick="openIncident(${i.id_anomalia})">
+        <td class="px-3 py-2.5 font-mono font-bold text-gray-900 dark:text-white">#${i.id_anomalia}</td>
+        <td class="px-3 py-2.5 text-xs text-gray-500 dark:text-gray-400 font-mono hidden sm:table-cell">${i.numero_placa||"—"}</td>
+        <td class="px-3 py-2.5 text-gray-700 dark:text-gray-300 max-w-32 truncate">${i.ubicacion||"—"}</td>
+        <td class="px-3 py-2.5">${gravBadge(g)}</td>
+        <td class="px-3 py-2.5 font-semibold ${Math.abs(parseFloat(desv))>40?"text-red-600 dark:text-red-400":"text-yellow-600 dark:text-yellow-400"}">${desv}</td>
+        <td class="px-3 py-2.5">${estadoBadge(i.estado_actual)}</td>
+        <td class="px-3 py-2.5 text-xs text-gray-500 dark:text-gray-400 hidden md:table-cell">${i.tecnico_asignado||"Sin asignar"}</td>
+        <td class="px-3 py-2.5 text-right text-blue-500 dark:text-blue-400 text-xs">Ver →</td>
+      </tr>`;
+    }).join("")}
+    </tbody></table></div>`;
+}
+
+function viewIncidencias(){
+  const isResp = currentUser.rol==="responsable";
+  const visibles = isResp ? incidents : incidents.filter(i=>!i.tecnico_asignado || i.tecnico_asignado===currentUser.nombre);
+  return `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4">
+    <div class="flex flex-col sm:flex-row gap-2 mb-4">
+      <input id="searchBox" oninput="filterIncTable()" placeholder="Buscar por ID, inversor o ubicación..." class="flex-1 border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+      <select id="filterEstado" onchange="filterIncTable()" class="border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2.5 text-sm">
+        <option value="">Todos los estados</option>
+        <option>Pendiente</option><option>Confirmada</option><option>En gestión</option><option>Escalada</option><option>Resuelta</option>
+      </select>
+    </div>
+    <div id="incTableWrap">${tablaIncidencias(visibles)}</div>
+  </div>`;
+}
+function filterIncTable(){
+  const s = document.getElementById("searchBox").value.toLowerCase();
+  const e = document.getElementById("filterEstado").value.toLowerCase();
+  document.querySelectorAll("#incTableWrap tbody tr").forEach(r=>{
+    const t = r.textContent.toLowerCase();
+    r.style.display = (t.includes(s) && t.includes(e)) ? "" : "none";
+  });
+}
+
+function openIncident(id){
+  currentIncident = incidents.find(i=>i.id_anomalia==id);
+  if (!currentIncident) return;
+  renderModal();
+}
+function closeModal(){ document.getElementById("modalOverlay")?.remove(); currentIncident=null; }
+function syncLocal(){ const idx=incidents.findIndex(i=>i.id_anomalia===currentIncident.id_anomalia); if(idx>-1) incidents[idx]={...currentIncident}; }
+function refreshAfterAction(){ syncLocal(); closeModal(); renderTab(); openIncident(currentIncident?.id_anomalia); }
+
+function timelineHtml(i){
+  if (!i.historial_arreglos) return `<p class="text-sm text-gray-400 italic">Sin eventos registrados</p>`;
+  const lineas = i.historial_arreglos.split("\n").filter(Boolean).reverse();
+  return `<div class="space-y-0">${lineas.map((l,idx)=>`
+    <div class="flex gap-3">
+      <div class="flex flex-col items-center">
+        <div class="w-2.5 h-2.5 rounded-full ${idx===0?"bg-blue-600":"bg-gray-300 dark:bg-gray-600"} mt-1.5"></div>
+        ${idx<lineas.length-1?'<div class="w-0.5 flex-1 bg-gray-200 dark:bg-gray-700"></div>':""}
+      </div>
+      <div class="pb-3 text-sm text-gray-700 dark:text-gray-300">${l}</div>
+    </div>`).join("")}</div>`;
+}
+
+function renderModal(){
+  const i = currentIncident;
+  const isResp = currentUser.rol==="responsable";
+  const isTec = currentUser.rol==="tecnico";
+  const esMia = i.tecnico_asignado === currentUser.nombre;
+  const sinAsignar = !i.tecnico_asignado;
+  const g = i.gravedad || gravedadDe(i.desviacion_porcentaje);
+  const imp = impactoDe(i);
+
+  const h2 = horasDesde(i.fecha_hora_ejecucion);
+  const alert2h = !i.fecha_confirmacion && h2>2 && i.estado_actual!=="Resuelta";
+  const h10 = horasDesde(i.fecha_confirmacion);
+  const alert10h = i.fecha_confirmacion && !i.fecha_resolucion && h10>10;
+
+  let acciones = "";
+
+  if (isTec && (sinAsignar || esMia) && !i.fecha_confirmacion && i.estado_actual!=="Resuelta" && !i.escalado_responsable){
+    acciones += `
+    <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl p-3 space-y-2">
+      <p class="text-sm font-semibold text-blue-800 dark:text-blue-300">Confirmar recepción (obligatorio indicar tiempo estimado)</p>
+      <select id="tiempoEstSelect" class="w-full border border-blue-200 dark:border-blue-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm">
+        <option value="">— Selecciona tiempo estimado —</option>
+        <option value="2 horas">2 horas</option>
+        <option value="6 horas">6 horas</option>
+        <option value="24 horas">24 horas</option>
+        <option value="46 horas">46 horas</option>
+      </select>
+      <button onclick="confirmarRecepcion()" class="w-full px-4 py-2.5 bg-blue-600 text-white rounded-xl font-semibold text-sm hover:bg-blue-700">✓ Confirmar recepción</button>
+    </div>`;
+  }
+
+  if (isTec && esMia && i.fecha_confirmacion && i.estado_actual!=="Resuelta"){
+    acciones += `
+    <div class="flex gap-2 flex-wrap">
+      <button onclick="marcarEnGestion()" class="flex-1 min-w-32 px-4 py-2.5 bg-orange-500 text-white rounded-xl font-semibold text-sm hover:bg-orange-600">🔧 Marcar en gestión</button>
+      <button onclick="resolverTecnico()" class="flex-1 min-w-32 px-4 py-2.5 bg-green-600 text-white rounded-xl font-semibold text-sm hover:bg-green-700">✔ Resuelta</button>
+    </div>
+    <button onclick="toggleAmpliacion()" class="w-full px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-xl text-sm font-semibold">⏳ Solicitar ampliación de tiempo</button>
+    <div id="ampliacionForm" class="hidden bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-xl p-3 space-y-2">
+      <select id="nuevoTiempo" class="w-full border border-yellow-300 dark:border-yellow-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm">
+        <option value="">Nuevo tiempo estimado</option>
+        <option value="2 horas">2 horas</option><option value="6 horas">6 horas</option>
+        <option value="24 horas">24 horas</option><option value="46 horas">46 horas</option>
+      </select>
+      <textarea id="motivoAmpliacion" rows="2" placeholder="Motivo de la ampliación..." class="w-full border border-yellow-300 dark:border-yellow-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm resize-none"></textarea>
+      <button onclick="solicitarAmpliacion()" class="w-full px-4 py-2 bg-yellow-500 text-white rounded-xl text-sm font-semibold hover:bg-yellow-600">Confirmar ampliación</button>
+    </div>`;
+  }
+
+  if (isResp && i.estado_actual!=="Resuelta"){
+    acciones += `<button onclick="resolverResponsable()" class="w-full px-4 py-2.5 bg-purple-600 text-white rounded-xl font-semibold text-sm hover:bg-purple-700">👔 Resolver como Responsable (sin técnico disponible)</button>`;
+  }
+
+  document.body.insertAdjacentHTML("beforeend", `
+  <div id="modalOverlay" class="fixed inset-0 z-50 flex items-center justify-center p-3" style="background:rgba(0,0,0,.55)" onclick="if(event.target.id==='modalOverlay')closeModal()">
+    <div class="bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto fade-in">
+      <div class="sticky top-0 bg-white dark:bg-gray-900 border-b dark:border-gray-800 px-5 py-4 flex items-start justify-between rounded-t-2xl z-10">
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-lg font-bold text-gray-900 dark:text-white">Incidencia #${i.id_anomalia}</h2>
+            ${gravBadge(g)} ${estadoBadge(i.estado_actual)}
+            ${i.escalado_responsable?'<span class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-600 text-white">⚠ ESCALADA</span>':""}
+          </div>
+          <p class="text-sm text-gray-500 dark:text-gray-400 mt-0.5">${i.ubicacion||"—"} · Inversor ${i.numero_placa||"—"}</p>
+        </div>
+        <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-2xl leading-none">×</button>
+      </div>
+      <div class="px-5 py-4 space-y-5">
+        ${alert2h?'<div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-3 text-sm text-red-700 dark:text-red-300 font-medium">⏱️ +2h sin confirmación — pendiente de escalado automático</div>':""}
+        ${alert10h?'<div class="bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-xl p-3 text-sm text-orange-700 dark:text-orange-300 font-medium">⏱️ +10h desde confirmación sin resolver</div>':""}
+
+        ${i.google_maps_url?`<a href="${i.google_maps_url}" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded-xl text-sm font-semibold hover:bg-blue-100 dark:hover:bg-blue-900/50">📍 Ver en Google Maps</a>`:""}
+
+        <div class="grid grid-cols-3 gap-2 text-center">
+          <div class="bg-red-50 dark:bg-red-900/20 rounded-xl p-2"><div class="text-sm font-bold text-red-600 dark:text-red-400">${fmtMoney(imp.dinero)}</div><div class="text-xs text-gray-500 dark:text-gray-400">Pérdida estimada</div></div>
+          <div class="bg-green-50 dark:bg-green-900/20 rounded-xl p-2"><div class="text-sm font-bold text-green-600 dark:text-green-400">${imp.co2.toFixed(1)} kg</div><div class="text-xs text-gray-500 dark:text-gray-400">CO₂ evitado</div></div>
+          <div class="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-2"><div class="text-sm font-bold text-blue-600 dark:text-blue-400">${i.numero_ampliaciones||0}</div><div class="text-xs text-gray-500 dark:text-gray-400">Ampliaciones</div></div>
+        </div>
+
+        ${acciones?`<div class="space-y-2">${acciones}</div>`:""}
+
+        <div>
+          <h3 class="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase mb-2">Datos técnicos</h3>
+          <div class="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
+            ${[["CUPS",i.cups],["Técnico",i.tecnico_asignado],["Detectada",fmt(i.fecha_hora_ejecucion)],
+              ["Irradiancia",i.irradiancia_solar?i.irradiancia_solar+" W/m²":null],["Temp. módulo",i.temperatura_modulo?i.temperatura_modulo+" °C":null],
+              ["Nubosidad",i.nubosidad_porcentaje!=null?i.nubosidad_porcentaje+"%":null],["Lectura real",i.lectura_real_kwh!=null?i.lectura_real_kwh+" kWh":null],
+              ["Lectura estimada",i.lectura_estimada_kwh!=null?i.lectura_estimada_kwh+" kWh":null],["Desviación",i.desviacion_porcentaje!=null?i.desviacion_porcentaje+"%":null],
+              ["Confirmación",fmt(i.fecha_confirmacion)],["Tiempo estimado",i.tiempo_estimado_reparacion],["Resolución",fmt(i.fecha_resolucion)],["Resuelto por",i.resuelto_por]
+            ].filter(([,v])=>v).map(([k,v])=>`<div><span class="text-gray-400 dark:text-gray-500">${k}:</span> <span class="font-medium text-gray-800 dark:text-gray-200">${v}</span></div>`).join("")}
+          </div>
+        </div>
+
+        ${i.datos_incidencia_detalle?`<div><h3 class="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase mb-2">Detalle</h3><p class="text-sm text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-gray-800 rounded-xl p-3 whitespace-pre-wrap">${i.datos_incidencia_detalle}</p></div>`:""}
+
+        <div class="bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-950/40 dark:to-purple-950/40 border border-indigo-100 dark:border-indigo-900 rounded-xl p-3">
+          <h3 class="text-xs font-bold text-indigo-700 dark:text-indigo-300 uppercase mb-1.5">🤖 Panel IA — Diagnóstico</h3>
+          <p class="text-sm text-indigo-800 dark:text-indigo-200">${diagnosticoIA(i)}</p>
+        </div>
+
+        <div>
+          <h3 class="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase mb-2">Línea temporal — trazabilidad completa</h3>
+          ${timelineHtml(i)}
+          <div class="mt-2 flex gap-2">
+            <textarea id="comentarioInput" placeholder="Añadir comentario..." rows="2" class="flex-1 text-sm border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl p-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-300"></textarea>
+            <button onclick="addComentario()" class="self-end px-4 py-2 bg-gray-800 dark:bg-gray-700 text-white rounded-xl text-sm font-semibold hover:bg-gray-900 dark:hover:bg-gray-600">Guardar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`);
+}
+
+function diagnosticoIA(i){
+  const desv = Math.abs(parseFloat(i.desviacion_porcentaje)||0);
+  const nub = parseFloat(i.nubosidad_porcentaje)||0;
+  if (desv>40 && nub<30) return "Desviación muy alta con baja nubosidad — probable fallo físico del inversor o paneles dañados. Se recomienda inspección presencial prioritaria.";
+  if (desv>40) return "Desviación grave. Aunque hay nubosidad significativa, no explica una caída tan alta — revisar conexiones e inversor.";
+  if (desv>=20) return "Desviación leve, compatible con suciedad acumulada o sombra parcial. Se recomienda limpieza de paneles.";
+  return "Producción dentro de parámetros esperados según condiciones meteorológicas.";
+}
+
+async function confirmarRecepcion(){
+  const tiempo = document.getElementById("tiempoEstSelect")?.value;
+  if (!tiempo) return toast("Debes indicar un tiempo estimado de reparación","error");
+  const now = new Date().toISOString();
+  const hist = appendHistorial(currentIncident, `Confirmó recepción de la incidencia. Tiempo estimado de reparación: ${tiempo}.`);
+  const payload = { estado_actual:"Confirmada", fecha_confirmacion:now, tiempo_estimado_reparacion:tiempo, tecnico_asignado:currentUser.nombre, historial_arreglos:hist };
+  await patchInc(currentIncident.id_anomalia, payload);
+  Object.assign(currentIncident, payload);
+  toast("✅ Recepción confirmada"); refreshAfterAction();
+}
+async function marcarEnGestion(){
+  const hist = appendHistorial(currentIncident, `Cambió el estado a "En gestión".`);
+  const payload = { estado_actual:"En gestión", historial_arreglos:hist };
+  await patchInc(currentIncident.id_anomalia, payload); Object.assign(currentIncident,payload);
+  toast("🔧 En gestión"); refreshAfterAction();
+}
+async function resolverTecnico(){
+  const now = new Date().toISOString();
+  const hist = appendHistorial(currentIncident, `Marcó la incidencia como Resuelta.`);
+  const payload = { estado_actual:"Resuelta", fecha_resolucion:now, resuelto_por:currentUser.nombre, historial_arreglos:hist };
+  await patchInc(currentIncident.id_anomalia, payload); Object.assign(currentIncident,payload);
+  toast("✅ Incidencia resuelta"); refreshAfterAction();
+}
+async function resolverResponsable(){
+  const now = new Date().toISOString();
+  const hist = appendHistorial(currentIncident, `Resolvió la incidencia directamente como Responsable (sin técnico disponible).`);
+  const payload = { estado_actual:"Resuelta", fecha_resolucion:now, resuelto_por:currentUser.nombre+" (Responsable)", historial_arreglos:hist };
+  await patchInc(currentIncident.id_anomalia, payload); Object.assign(currentIncident,payload);
+  toast("✅ Resuelta por Responsable"); refreshAfterAction();
+}
+function toggleAmpliacion(){ document.getElementById("ampliacionForm")?.classList.toggle("hidden"); }
+async function solicitarAmpliacion(){
+  const nuevo = document.getElementById("nuevoTiempo")?.value;
+  const motivo = document.getElementById("motivoAmpliacion")?.value?.trim();
+  if (!nuevo || !motivo) return toast("Indica nuevo tiempo y motivo","error");
+  const hist = appendHistorial(currentIncident, `Solicitó ampliación de tiempo → nuevo plazo: ${nuevo}. Motivo: ${motivo}`);
+  const payload = {
+    tiempo_estimado_reparacion: nuevo,
+    numero_ampliaciones: (currentIncident.numero_ampliaciones||0)+1,
+    motivo_ampliacion: motivo,
+    historial_arreglos: hist
+  };
+  await patchInc(currentIncident.id_anomalia, payload); Object.assign(currentIncident,payload);
+  toast("✅ Ampliación registrada"); refreshAfterAction();
+}
+async function addComentario(){
+  const val = document.getElementById("comentarioInput")?.value?.trim();
+  if (!val) return;
+  const hist = appendHistorial(currentIncident, `Comentario: ${val}`);
+  await patchInc(currentIncident.id_anomalia, {historial_arreglos:hist});
+  Object.assign(currentIncident,{historial_arreglos:hist});
+  toast("✅ Comentario guardado"); refreshAfterAction();
+}
+
+function viewMapa(){
+  const conMapa = incidents.filter(i=>i.google_maps_url);
+  if (!conMapa.length) return `<div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-8 text-center text-gray-400">No hay incidencias con ubicación de Google Maps</div>`;
+  const colorEstado = (i) => i.escalado_responsable && i.estado_actual!=="Resuelta" ? "bg-red-500" : i.estado_actual==="Resuelta" ? "bg-green-500" : i.estado_actual==="En gestión" ? "bg-yellow-500" : "bg-gray-400";
+  return `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-1">Plantas con incidencias</h3>
+    <p class="text-xs text-gray-400 mb-4">🟢 Resuelta · 🟡 En gestión · 🔴 Escalada · ⚪ Pendiente</p>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      ${conMapa.map(i=>`
+        <div onclick="openIncident(${i.id_anomalia})" class="border dark:border-gray-700 rounded-xl p-3 cursor-pointer hover:shadow-md transition-shadow ${i.escalado_responsable&&i.estado_actual!=="Resuelta"?"pulse-red border-red-200 dark:border-red-800":""}">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="w-3 h-3 rounded-full ${colorEstado(i)}"></span>
+            <span class="font-bold text-sm text-gray-800 dark:text-gray-100">#${i.id_anomalia} — ${i.ubicacion||"—"}</span>
+          </div>
+          <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Inversor ${i.numero_placa||"—"} · Desv. ${i.desviacion_porcentaje!=null?parseFloat(i.desviacion_porcentaje).toFixed(1)+"%":"—"}</p>
+          <a href="${i.google_maps_url}" target="_blank" onclick="event.stopPropagation()" class="text-xs text-blue-600 dark:text-blue-400 hover:underline">📍 Abrir en Google Maps</a>
+        </div>`).join("")}
+    </div>
+  </div>`;
+}
+
+function viewBosque(){
+  const resueltas = incidents.filter(i=>i.estado_actual==="Resuelta");
+  const totalCO2 = incidents.reduce((a,i)=>a+impactoDe(i).co2,0);
+  const arboles = Math.round(totalCO2/KG_CO2_POR_ARBOL);
+  const totalArbolesGrafico = Math.max(arboles,1);
+
+  const arbolEmojis = ["🌱","🌿","🌳","🌲"];
+  const grid = Array.from({length: Math.min(totalArbolesGrafico, 60)}, (_,idx)=>{
+    const emoji = arbolEmojis[Math.min(3, Math.floor(idx/15))];
+    return `<span class="grow-tree inline-block text-3xl" style="animation-delay:${idx*0.02}s">${emoji}</span>`;
+  }).join("");
+
+  return `
+  <div class="bg-gradient-to-br from-green-700 to-emerald-900 rounded-2xl p-6 text-white text-center mb-5 shadow-xl">
+    <h2 class="text-2xl font-extrabold mb-1">🌳 BOSQUE SOLAR</h2>
+    <p class="text-green-200 text-sm mb-4">El impacto ambiental positivo generado por la planta</p>
+    <div class="text-5xl font-black">${arboles}</div>
+    <div class="text-green-200 text-sm">árboles equivalentes</div>
+  </div>
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-5 mb-5">
+    <div class="flex flex-wrap gap-1 justify-center leading-none">${grid || '<p class="text-gray-400 text-sm">Aún no hay árboles — resuelve incidencias para hacer crecer el bosque 🌱</p>'}</div>
+  </div>
+  <div class="grid sm:grid-cols-3 gap-3 mb-5">
+    <div class="bg-white dark:bg-gray-900 rounded-xl border dark:border-gray-800 p-4 text-center"><div class="text-2xl font-bold text-green-700 dark:text-green-400">${totalCO2.toFixed(0)} kg</div><div class="text-xs text-gray-500 dark:text-gray-400">CO₂ evitado total</div></div>
+    <div class="bg-white dark:bg-gray-900 rounded-xl border dark:border-gray-800 p-4 text-center"><div class="text-2xl font-bold text-blue-700 dark:text-blue-400">${(incidents.reduce((a,i)=>a+(parseFloat(i.lectura_real_kwh)||0),0)/CONSUMO_HOGAR_ANUAL).toFixed(1)}</div><div class="text-xs text-gray-500 dark:text-gray-400">Hogares abastecidos/año</div></div>
+    <div class="bg-white dark:bg-gray-900 rounded-xl border dark:border-gray-800 p-4 text-center"><div class="text-2xl font-bold text-emerald-700 dark:text-emerald-400">${resueltas.length}</div><div class="text-xs text-gray-500 dark:text-gray-400">Incidencias resueltas que suman al bosque</div></div>
+  </div>
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-3 text-sm">Evolución mensual de CO₂ evitado</h3>
+    <canvas id="bosqueChart" height="90"></canvas>
+  </div>`;
+}
+function drawBosqueChart(){
+  const ctx = document.getElementById("bosqueChart"); if(!ctx) return;
+  const porMes = {};
+  incidents.forEach(i=>{
+    const f = i.fecha_hora_ejecucion ? new Date(i.fecha_hora_ejecucion) : null;
+    if(!f) return;
+    const key = f.toLocaleString("es-ES",{month:"short",year:"2-digit"});
+    porMes[key] = (porMes[key]||0) + impactoDe(i).co2;
+  });
+  new Chart(ctx, {type:"bar", data:{labels:Object.keys(porMes), datasets:[{label:"CO₂ evitado (kg)", data:Object.values(porMes), backgroundColor:"#16a34a", borderRadius:6}]},
+    options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}});
+}
+
+function viewImpacto(){
+  const activas = incidents.filter(i=>i.estado_actual!=="Resuelta");
+  const resueltas = incidents.filter(i=>i.estado_actual==="Resuelta");
+  const dineroPerdidoActivo = activas.reduce((a,i)=>a+impactoDe(i).dinero,0);
+  const dineroRecuperado = resueltas.reduce((a,i)=>a+impactoDe(i).dinero,0);
+  const totalAcumulado = dineroPerdidoActivo + dineroRecuperado;
+
+  return `
+  <div class="grid sm:grid-cols-3 gap-4 mb-5">
+    <div class="bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-900 rounded-2xl p-5 text-center">
+      <div class="text-2xl font-bold text-red-600 dark:text-red-400">${fmtMoney(dineroPerdidoActivo)}</div>
+      <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">💸 Dinero perdido (incidencias activas)</div>
+    </div>
+    <div class="bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-900 rounded-2xl p-5 text-center">
+      <div class="text-2xl font-bold text-green-600 dark:text-green-400">${fmtMoney(dineroRecuperado)}</div>
+      <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">💰 Dinero recuperado tras resolución</div>
+    </div>
+    <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-900 rounded-2xl p-5 text-center">
+      <div class="text-2xl font-bold text-blue-600 dark:text-blue-400">${fmtMoney(totalAcumulado)}</div>
+      <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">📊 Impacto económico acumulado</div>
+    </div>
+  </div>
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-4">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-3 text-sm">Impacto económico mensual</h3>
+    <canvas id="impactoChart" height="100"></canvas>
+  </div>`;
+}
+function drawImpactoCharts(){
+  const ctx = document.getElementById("impactoChart"); if(!ctx) return;
+  const porMes = {};
+  incidents.forEach(i=>{
+    const f = i.fecha_hora_ejecucion ? new Date(i.fecha_hora_ejecucion) : null;
+    if(!f) return;
+    const key = f.toLocaleString("es-ES",{month:"short",year:"2-digit"});
+    porMes[key] = (porMes[key]||0) + impactoDe(i).dinero;
+  });
+  new Chart(ctx, {type:"line", data:{labels:Object.keys(porMes), datasets:[{label:"€ impacto", data:Object.values(porMes), borderColor:"#2563eb", backgroundColor:"rgba(37,99,235,.1)", fill:true, tension:.35}]},
+    options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}});
+}
+
+function viewRanking(){
+  const porTecnico = {};
+  incidents.forEach(i=>{
+    if (!i.tecnico_asignado) return;
+    porTecnico[i.tecnico_asignado] = porTecnico[i.tecnico_asignado] || {resueltas:0, tiempos:[]};
+    if (i.estado_actual==="Resuelta") porTecnico[i.tecnico_asignado].resueltas++;
+    if (i.fecha_confirmacion && i.fecha_resolucion){
+      porTecnico[i.tecnico_asignado].tiempos.push(horasEntre(i.fecha_confirmacion,i.fecha_resolucion));
+    }
+  });
+  const ranking = Object.entries(porTecnico).map(([nombre,d])=>({
+    nombre, resueltas:d.resueltas,
+    tiempoMedio: d.tiempos.length ? (d.tiempos.reduce((a,b)=>a+b,0)/d.tiempos.length).toFixed(1) : "—"
+  })).sort((a,b)=>b.resueltas-a.resueltas);
+
+  const medallas = ["🥇","🥈","🥉"];
+  return `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-5">
+    <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-4">🏆 Ranking de técnicos</h3>
+    ${ranking.length ? ranking.map((t,idx)=>`
+      <div class="flex items-center gap-4 py-3 ${idx<ranking.length-1?"border-b dark:border-gray-800":""}">
+        <div class="text-2xl w-10 text-center">${medallas[idx]||"🔧"}</div>
+        <div class="flex-1">
+          <div class="font-semibold text-gray-800 dark:text-gray-100">${t.nombre}</div>
+          <div class="text-xs text-gray-400">Tiempo medio resolución: ${t.tiempoMedio}h</div>
+        </div>
+        <div class="text-right">
+          <div class="text-xl font-bold text-blue-600 dark:text-blue-400">${t.resueltas}</div>
+          <div class="text-xs text-gray-400">resueltas</div>
+        </div>
+      </div>`).join("") : '<p class="text-sm text-gray-400 text-center py-6">Sin datos de técnicos todavía</p>'}
+  </div>`;
+}
+
+function viewHistorialDescarga(){
+  const tecnicosUnicos = [...new Set(incidents.map(i=>i.tecnico_asignado).filter(Boolean))];
+  return `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-5 space-y-6">
+    <div>
+      <h3 class="font-bold text-gray-800 dark:text-gray-100 mb-1">📥 Descargar historial</h3>
+      <p class="text-xs text-gray-400">Exporta los datos en formato CSV compatible con Excel</p>
+    </div>
+
+    <div class="grid sm:grid-cols-2 gap-3">
+      <button onclick="descargarCSV('todo')" class="text-left border dark:border-gray-700 rounded-xl p-4 hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:border-blue-300 dark:hover:border-blue-700 transition-colors">
+        <div class="font-semibold text-gray-800 dark:text-gray-100">📋 Historial completo</div>
+        <div class="text-xs text-gray-400 mt-1">Todas las incidencias con todos los campos</div>
+      </button>
+      <button onclick="descargarCSV('resueltas')" class="text-left border dark:border-gray-700 rounded-xl p-4 hover:bg-green-50 dark:hover:bg-green-900/20 hover:border-green-300 dark:hover:border-green-700 transition-colors">
+        <div class="font-semibold text-gray-800 dark:text-gray-100">✅ Solo resueltas</div>
+        <div class="text-xs text-gray-400 mt-1">Incidencias cerradas con fecha de resolución</div>
+      </button>
+      <button onclick="descargarCSV('escaladas')" class="text-left border dark:border-gray-700 rounded-xl p-4 hover:bg-red-50 dark:hover:bg-red-900/20 hover:border-red-300 dark:hover:border-red-700 transition-colors">
+        <div class="font-semibold text-gray-800 dark:text-gray-100">⚠️ Solo escaladas</div>
+        <div class="text-xs text-gray-400 mt-1">Incidencias que requirieron intervención del responsable</div>
+      </button>
+      <button onclick="descargarCSV('graves')" class="text-left border dark:border-gray-700 rounded-xl p-4 hover:bg-orange-50 dark:hover:bg-orange-900/20 hover:border-orange-300 dark:hover:border-orange-700 transition-colors">
+        <div class="font-semibold text-gray-800 dark:text-gray-100">🔴 Solo graves</div>
+        <div class="text-xs text-gray-400 mt-1">Desviación superior al 40%</div>
+      </button>
+    </div>
+
+    <div class="border-t dark:border-gray-800 pt-5">
+      <h4 class="font-semibold text-gray-700 dark:text-gray-200 text-sm mb-3">Filtro personalizado</h4>
+      <div class="grid sm:grid-cols-2 gap-3 mb-3">
+        <div>
+          <label class="text-xs text-gray-500 dark:text-gray-400 block mb-1">Desde</label>
+          <input type="date" id="filtroDesde" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2 text-sm"/>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 dark:text-gray-400 block mb-1">Hasta</label>
+          <input type="date" id="filtroHasta" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2 text-sm"/>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 dark:text-gray-400 block mb-1">Técnico</label>
+          <select id="filtroTecnico" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2 text-sm">
+            <option value="">Todos</option>
+            ${tecnicosUnicos.map(t=>`<option value="${t}">${t}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 dark:text-gray-400 block mb-1">Estado</label>
+          <select id="filtroEstadoCSV" class="w-full border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2 text-sm">
+            <option value="">Todos</option>
+            <option>Pendiente</option><option>Confirmada</option><option>En gestión</option><option>Escalada</option><option>Resuelta</option>
+          </select>
+        </div>
+      </div>
+      <button onclick="descargarCSV('filtro')" class="w-full px-4 py-2.5 bg-blue-700 text-white rounded-xl font-semibold text-sm hover:bg-blue-800">⬇️ Descargar con estos filtros</button>
+    </div>
+
+    <div class="border-t dark:border-gray-800 pt-5">
+      <h4 class="font-semibold text-gray-700 dark:text-gray-200 text-sm mb-3">Descargar incidencia individual</h4>
+      <div class="flex gap-2">
+        <select id="incidenciaIndividual" class="flex-1 border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white rounded-xl px-3 py-2 text-sm">
+          <option value="">Selecciona una incidencia</option>
+          ${incidents.map(i=>`<option value="${i.id_anomalia}">#${i.id_anomalia} — ${i.ubicacion||"—"}</option>`).join("")}
+        </select>
+        <button onclick="descargarCSV('individual')" class="px-4 py-2 bg-gray-700 text-white rounded-xl text-sm font-semibold hover:bg-gray-800">⬇️ Descargar</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function csvEscape(v){
+  if (v==null) return "";
+  const s = String(v).replace(/"/g,'""');
+  return /[",\n;]/.test(s) ? `"${s}"` : s;
+}
+
+function descargarCSV(modo){
+  let data = [...incidents];
+  let nombreArchivo = "historial_incidencias";
+
+  if (modo==="resueltas"){ data = data.filter(i=>i.estado_actual==="Resuelta"); nombreArchivo="incidencias_resueltas"; }
+  if (modo==="escaladas"){ data = data.filter(i=>i.escalado_responsable); nombreArchivo="incidencias_escaladas"; }
+  if (modo==="graves"){ data = data.filter(i=>Math.abs(parseFloat(i.desviacion_porcentaje)||0)>40); nombreArchivo="incidencias_graves"; }
+  if (modo==="individual"){
+    const id = document.getElementById("incidenciaIndividual")?.value;
+    if (!id) return toast("Selecciona una incidencia","error");
+    data = data.filter(i=>i.id_anomalia==id); nombreArchivo=`incidencia_${id}`;
+  }
+  if (modo==="filtro"){
+    const desde = document.getElementById("filtroDesde")?.value;
+    const hasta = document.getElementById("filtroHasta")?.value;
+    const tecnico = document.getElementById("filtroTecnico")?.value;
+    const estado = document.getElementById("filtroEstadoCSV")?.value;
+    if (desde) data = data.filter(i=>i.fecha_hora_ejecucion && new Date(i.fecha_hora_ejecucion) >= new Date(desde));
+    if (hasta) data = data.filter(i=>i.fecha_hora_ejecucion && new Date(i.fecha_hora_ejecucion) <= new Date(hasta+"T23:59:59"));
+    if (tecnico) data = data.filter(i=>i.tecnico_asignado===tecnico);
+    if (estado) data = data.filter(i=>i.estado_actual===estado);
+    nombreArchivo = "historial_filtrado";
+  }
+
+  if (!data.length) return toast("No hay datos para exportar con estos filtros","error");
+
+  const cols = ["id_anomalia","cups","numero_placa","ubicacion","nombre_tecnico","tecnico_asignado","fecha_hora_ejecucion",
+    "irradiancia_solar","temperatura_modulo","nubosidad_porcentaje","lectura_real_kwh","lectura_estimada_kwh","desviacion_porcentaje",
+    "gravedad","tipo_incidencia_actual","estado_actual","fecha_confirmacion","tiempo_estimado_reparacion","numero_ampliaciones",
+    "motivo_ampliacion","fecha_resolucion","resuelto_por","escalado_responsable","fecha_escalado","motivo_escalado","historial_arreglos"];
+
+  const header = cols.join(";");
+  const rows = data.map(i => cols.map(c => csvEscape(i[c])).join(";"));
+  const csv = "\uFEFF" + [header, ...rows].join("\n");
+
+  const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `${nombreArchivo}_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  toast(`✅ Descargado: ${data.length} registro(s)`);
+}
+
+function viewUsuarios(){
+  if (currentUser.rol!=="responsable") return `<div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-8 text-center text-gray-400">Acceso restringido al responsable</div>`;
+  return `
+  <div class="space-y-5">
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-gray-800 dark:text-gray-100">👷 Técnicos</h3>
+        <button onclick="toggleNuevoForm('tecnico')" class="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm font-semibold hover:bg-blue-700">+ Añadir técnico</button>
+      </div>
+      <div id="formTecnico" class="hidden bg-blue-50 dark:bg-blue-900/20 rounded-xl p-3 mb-4 space-y-2">
+        <input id="newTecNombre" placeholder="Nombre completo" class="w-full border border-blue-200 dark:border-blue-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newTecEmail" placeholder="Email" type="email" class="w-full border border-blue-200 dark:border-blue-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newTecPass" placeholder="Contraseña" class="w-full border border-blue-200 dark:border-blue-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newTecTel" placeholder="Teléfono (opcional)" class="w-full border border-blue-200 dark:border-blue-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <button onclick="crearTecnico()" class="w-full px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-semibold hover:bg-blue-700">Crear técnico</button>
+      </div>
+      <div class="divide-y dark:divide-gray-800">
+        ${tecnicosDB.map(t=>`
+          <div class="flex items-center justify-between py-3">
+            <div>
+              <div class="font-semibold text-gray-800 dark:text-gray-100 text-sm">${t.nombre} ${!t.activo?'<span class="text-xs text-gray-400">(inactivo)</span>':''}</div>
+              <div class="text-xs text-gray-400">${t.email} ${t.telefono?"· "+t.telefono:""}</div>
+            </div>
+            <button onclick="toggleActivoTecnico(${t.id},${t.activo})" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${t.activo?"bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50":"bg-green-50 dark:bg-green-900/30 text-green-600 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/50"}">
+              ${t.activo?"Desactivar":"Activar"}
+            </button>
+          </div>`).join("") || '<p class="text-sm text-gray-400 py-4">No hay técnicos</p>'}
+      </div>
+    </div>
+
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border dark:border-gray-800 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-gray-800 dark:text-gray-100">👔 Responsables</h3>
+        <button onclick="toggleNuevoForm('responsable')" class="px-3 py-1.5 bg-purple-600 text-white rounded-lg text-sm font-semibold hover:bg-purple-700">+ Añadir responsable</button>
+      </div>
+      <div id="formResponsable" class="hidden bg-purple-50 dark:bg-purple-900/20 rounded-xl p-3 mb-4 space-y-2">
+        <input id="newRespNombre" placeholder="Nombre completo" class="w-full border border-purple-200 dark:border-purple-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newRespEmail" placeholder="Email" type="email" class="w-full border border-purple-200 dark:border-purple-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newRespPass" placeholder="Contraseña" class="w-full border border-purple-200 dark:border-purple-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <input id="newRespTel" placeholder="Teléfono (opcional)" class="w-full border border-purple-200 dark:border-purple-700 dark:bg-gray-800 dark:text-white rounded-lg px-3 py-2 text-sm"/>
+        <button onclick="crearResponsable()" class="w-full px-3 py-2 bg-purple-600 text-white rounded-lg text-sm font-semibold hover:bg-purple-700">Crear responsable</button>
+      </div>
+      <div class="divide-y dark:divide-gray-800">
+        ${responsablesDB.map(r=>`
+          <div class="flex items-center justify-between py-3">
+            <div>
+              <div class="font-semibold text-gray-800 dark:text-gray-100 text-sm">${r.nombre} ${!r.activo?'<span class="text-xs text-gray-400">(inactivo)</span>':''}</div>
+              <div class="text-xs text-gray-400">${r.email} ${r.telefono?"· "+r.telefono:""}</div>
+            </div>
+            <button onclick="toggleActivoResponsable(${r.id},${r.activo})" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${r.activo?"bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50":"bg-green-50 dark:bg-green-900/30 text-green-600 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/50"}">
+              ${r.activo?"Desactivar":"Activar"}
+            </button>
+          </div>`).join("") || '<p class="text-sm text-gray-400 py-4">No hay responsables</p>'}
+      </div>
+    </div>
+  </div>`;
+}
+function toggleNuevoForm(tipo){ document.getElementById(tipo==="tecnico"?"formTecnico":"formResponsable")?.classList.toggle("hidden"); }
+async function crearTecnico(){
+  const nombre=document.getElementById("newTecNombre").value.trim();
+  const email=document.getElementById("newTecEmail").value.trim().toLowerCase();
+  const pass=document.getElementById("newTecPass").value;
+  const tel=document.getElementById("newTecTel").value.trim();
+  if (!nombre||!email||!pass) return toast("Completa nombre, email y contraseña","error");
+  await sb("tecnicos",{method:"POST", body:JSON.stringify({nombre,email,password:pass,telefono:tel||null})});
+  toast("✅ Técnico creado"); await loadAll(); switchTab("usuarios");
+}
+async function crearResponsable(){
+  const nombre=document.getElementById("newRespNombre").value.trim();
+  const email=document.getElementById("newRespEmail").value.trim().toLowerCase();
+  const pass=document.getElementById("newRespPass").value;
+  const tel=document.getElementById("newRespTel").value.trim();
+  if (!nombre||!email||!pass) return toast("Completa nombre, email y contraseña","error");
+  await sb("responsables",{method:"POST", body:JSON.stringify({nombre,email,password:pass,telefono:tel||null})});
+  toast("✅ Responsable creado"); await loadAll(); switchTab("usuarios");
+}
+async function toggleActivoTecnico(id,activo){
+  await sb(`tecnicos?id=eq.${id}`,{method:"PATCH", body:JSON.stringify({activo:!activo})});
+  toast(activo?"Técnico desactivado":"Técnico activado"); await loadAll(); switchTab("usuarios");
+}
+async function toggleActivoResponsable(id,activo){
+  await sb(`responsables?id=eq.${id}`,{method:"PATCH", body:JSON.stringify({activo:!activo})});
+  toast(activo?"Responsable desactivado":"Responsable activado"); await loadAll(); switchTab("usuarios");
+}
+
+renderLogin();
+</script>
+</body>
+</html>
